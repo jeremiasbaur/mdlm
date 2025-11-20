@@ -43,6 +43,9 @@ training:
   importance_sampling: False
   sampling_eps: 1e-3
   change_of_variables: False
+  clipped_sampling: False
+  clip_beta: 0.0
+  clip_omega: 1.0
 
 eval:
   checkpoint_path: ''  # Used to evaluate a checkpoint after training.

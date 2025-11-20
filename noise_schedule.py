@@ -56,6 +56,13 @@ class Noise(abc.ABC, nn.Module):
     """
     pass
 
+  @abc.abstractmethod
+  def inverse_total_noise(self, mask_rate):
+    """
+    Computes the time t that corresponds to a given mask_rate.
+    mask_rate = 1 - exp(-total_noise(t))
+    """
+    pass
 
 class CosineNoise(Noise):
   def __init__(self, eps=1e-3):
@@ -72,6 +79,17 @@ class CosineNoise(Noise):
     cos = torch.cos(t * torch.pi / 2)
     return - torch.log(self.eps + (1 - self.eps) * cos)
 
+  def inverse_total_noise(self, mask_rate):
+    # mask_rate = 1 - exp(-sigma(t)) = 1 - (eps + (1-eps) * cos(t*pi/2))
+    # 1 - mask_rate = eps + (1-eps) * cos(t*pi/2)
+    # cos(t*pi/2) = (1 - mask_rate - eps) / (1 - eps)
+    # t*pi/2 = acos(...)
+    # t = acos(...) * (2 / pi)
+    cos_val = (1 - mask_rate - self.eps) / (1 - self.eps)
+    # Clamp to valid range for acos
+    cos_val = torch.clamp(cos_val, -1.0, 1.0)
+    t = torch.acos(cos_val) * (2 / torch.pi)
+    return t
 
 class CosineSqrNoise(Noise):
   def __init__(self, eps=1e-3):
@@ -89,6 +107,16 @@ class CosineSqrNoise(Noise):
     cos = torch.cos(t * torch.pi / 2) ** 2
     return - torch.log(self.eps + (1 - self.eps) * cos)
 
+  def inverse_total_noise(self, mask_rate):
+    # mask_rate = 1 - exp(-sigma(t)) = 1 - (eps + (1-eps) * cos^2(t*pi/2))
+    # cos^2(t*pi/2) = (1 - mask_rate - eps) / (1 - eps)
+    # cos(t*pi/2) = sqrt(...)
+    # t = acos(sqrt(...)) * (2 / pi)
+    cos_sq_val = (1 - mask_rate - self.eps) / (1 - self.eps)
+    # Clamp to valid range for sqrt and acos (0 to 1)
+    cos_sq_val = torch.clamp(cos_sq_val, 0.0, 1.0)
+    t = torch.acos(torch.sqrt(cos_sq_val)) * (2 / torch.pi)
+    return t
 
 class Linear(Noise):
   def __init__(self, sigma_min=0, sigma_max=10, dtype=torch.float32):
@@ -109,6 +137,16 @@ class Linear(Noise):
     return (sigma_t - self.sigma_min) / (
       self.sigma_max - self.sigma_min)
 
+  def inverse_total_noise(self, mask_rate):
+    # mask_rate = 1 - exp(-sigma(t))
+    # 1 - mask_rate = exp(-sigma(t))
+    # -log(1 - mask_rate) = sigma(t)
+    # sigma(t) = sigma_min + t * (sigma_max - sigma_min)
+    # t = (sigma(t) - sigma_min) / (sigma_max - sigma_min)
+    sigma_t = -torch.log1p(-mask_rate)
+    t = (sigma_t - self.sigma_min) / (self.sigma_max - self.sigma_min)
+    return t
+
 
 class GeometricNoise(Noise):
   def __init__(self, sigma_min=1e-3, sigma_max=1):
@@ -122,6 +160,19 @@ class GeometricNoise(Noise):
   def total_noise(self, t):
     return self.sigmas[0] ** (1 - t) * self.sigmas[1] ** t
 
+  def inverse_total_noise(self, mask_rate):
+    # mask_rate = 1 - exp(-sigma(t))
+    # sigma(t) = -log(1 - mask_rate)
+    # sigma(t) = sigma_min^(1-t) * sigma_max^t
+    # log(sigma(t)) = (1-t)log(sigma_min) + t*log(sigma_max)
+    # log(sigma(t)) = log(sigma_min) + t * (log(sigma_max) - log(sigma_min))
+    # t = (log(sigma(t)) - log(sigma_min)) / (log(sigma_max) - log(sigma_min))
+    sigma_t = -torch.log1p(-mask_rate)
+    log_sigma_t = torch.log(sigma_t)
+    log_sigma_min = torch.log(self.sigmas[0])
+    log_sigma_max = torch.log(self.sigmas[1])
+    t = (log_sigma_t - log_sigma_min) / (log_sigma_max - log_sigma_min)
+    return t
 
 class LogLinearNoise(Noise):
   """Log Linear noise schedule.
@@ -149,3 +200,12 @@ class LogLinearNoise(Noise):
     sigma_t = - torch.log1p(- torch.exp(t * f_T + (1 - t) * f_0))
     t = - torch.expm1(- sigma_t) / (1 - self.eps)
     return t
+
+  def inverse_total_noise(self, mask_rate):
+    # mask_rate = 1 - exp(-sigma(t))
+    # 1 - mask_rate = exp(-sigma(t))
+    # -log(1-mask_rate) = sigma(t)
+    # log(1-(1-eps)*t) = log(1-mask_rate)
+    # (1-eps)*t = mask_rate
+    # t = mask-rate / (1-eps)
+    return mask_rate / (1 - self.eps)

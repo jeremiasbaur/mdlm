@@ -350,12 +350,103 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
       config.model.cond_dim)
     self.scale_by_sigma = config.model.scale_by_sigma
 
+    init_type = omegaconf.OmegaConf.select(
+            config, "model.init.type", default='default'
+    )
+    if init_type == 'symmetric':
+        self.apply_symmetric_initialization()
+
+  @torch.no_grad()
+  def apply_symmetric_initialization(self):
+      """
+      Applies symmetric initialization to Wq and Wk matrices in-place,
+      as described in Saponati et al. (2025).
+      
+      This method sets W_k = W_q.
+      """
+      print("Applying symmetric initialization to attention blocks...")
+      
+      if not hasattr(self, 'blocks'):
+          print("Warning: Model has no 'blocks' attribute. Skipping symmetric init.")
+          return
+
+      applied_count = 0
+      for i, block in enumerate(self.blocks):
+          # Find the packed QKV layer in the attention block
+          if not (hasattr(block, 'attn_qkv') and 
+                  isinstance(block.attn_qkv, nn.Linear)):
+              print(f"Warning: Skipping block {i}, 'attn_qkv' not found.")
+              continue
+
+          qkv_weight = block.attn_qkv.weight
+
+          # Split into Q, K, V weights (assumes dim 0 is 3 * hidden_dim)
+          q_weight, k_weight, _ = torch.chunk(qkv_weight, 3, dim=0)
+          
+          # Set Wk = Wq
+          # Note: The DDiTBlock sets bias=False, so we don't need to copy biases.
+          k_weight.copy_(q_weight.detach())
+
+          applied_count += 1
+
+      print(f"Symmetric initialization applied to {applied_count} blocks.")
+  
+  def apply_optimized_symmetric_init(self):
+      """
+      Applies Orthogonal Symmetric Initialization to a DiT model with RoPE.
+      
+      Logic:
+      1. Initialize W_q as an Orthogonal matrix. 
+        This ensures that the 'Half-Split' pairs (col i and col i+d/2) are 
+        orthogonal, maximizing the effectiveness of the RoPE 'twist' from step 0.
+      2. Set W_k = W_q (Hard Symmetry).
+        This places the model in the 'Saponati Basin', enabling the speed-up.
+      """
+      print("Applying Orthogonal Symmetric Init...")
+      
+      # Loop over all DDiT Blocks
+      for i, block in enumerate(self.blocks):
+          
+          # Access the fused QKV weight
+          qkv_weight = block.attn_qkv.weight.data
+          hidden_dim = self.config.model.hidden_size
+
+          # Extract Q, K, V (views)
+          q_chunk = qkv_weight[0:hidden_dim]
+          k_chunk = qkv_weight[hidden_dim:2*hidden_dim]
+          #v_chunk = qkv_weight[2*hidden_dim:]
+          
+          # Orthogonalize Q
+          # We process Q 'Head-wise' to be rigorous, though global orthogonality is also fine.
+          n_heads = self.config.model.n_heads
+          head_dim = self.config.model.hidden_size // n_heads
+          
+          # Reshape Q to [Heads, Head_Dim, Hidden_Dim]
+          q_reshaped = q_chunk.view(n_heads, head_dim, hidden_dim)
+          
+          # Initialize each head independently to be orthogonal
+          with torch.no_grad():
+              for h in range(n_heads):
+                  # Generate a semi-orthogonal matrix of shape (Head_Dim, Hidden_Dim)
+                  # 'gain=1' is standard for linear layers
+                  nn.init.orthogonal_(q_reshaped[h], gain=1.0)
+          
+          # 4. Force Symmetry: Copy Q exactly to K
+          k_chunk.copy_(q_chunk)
+          
+          # 5. (Optional) Initialize V standardly (e.g., Xavier/Kaiming)
+          # nn.init.kaiming_uniform_(v_chunk, a=math.sqrt(5))
+          
+          print(f"Block {i}: W_q orthogonalized and copied to W_k.")
+
+      print("Initialization Complete.")
+
   def _get_bias_dropout_scale(self):
     if self.training:
       return bias_dropout_add_scale_fused_train
     else:
       return  bias_dropout_add_scale_fused_inference
-
+  
   def forward(self, indices, sigma):
     x = self.vocab_embed(indices)
     c = F.silu(self.sigma_map(sigma))

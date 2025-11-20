@@ -344,12 +344,14 @@ def get_dataset(
   elif dataset_name == 'openwebtext-train':
     dataset = datasets.load_dataset(
       'openwebtext',
+      trust_remote_code=True,
       split='train[:-100000]',
       cache_dir=cache_dir,
       streaming=streaming)
   elif dataset_name == 'openwebtext-valid':
     dataset = datasets.load_dataset(
       'openwebtext',
+      trust_remote_code=True,
       split='train[-100000:]',
       cache_dir=cache_dir,
       streaming=streaming)

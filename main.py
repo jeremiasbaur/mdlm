@@ -12,6 +12,8 @@ import dataloader
 import diffusion
 import utils
 
+from attention_geometry import AttentionMatrixMonitor
+
 omegaconf.OmegaConf.register_new_resolver(
   'cwd', os.getcwd)
 omegaconf.OmegaConf.register_new_resolver(
@@ -166,6 +168,12 @@ def _train(config, logger, tokenizer):
   if 'callbacks' in config:
     for _, callback in config.callbacks.items():
       callbacks.append(hydra.utils.instantiate(callback))
+
+  monitor_callback = AttentionMatrixMonitor(
+        log_every_n_steps = omegaconf.OmegaConf.select(
+              config, "trainer.log_scores_every_n_steps", default=1600)
+    )
+  callbacks.append(monitor_callback)
 
   train_ds, valid_ds = dataloader.get_dataloaders(
     config, tokenizer)

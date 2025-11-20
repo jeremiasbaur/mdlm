@@ -82,6 +82,11 @@ class Diffusion(L.LightningModule):
     self.antithetic_sampling = self.config.training.antithetic_sampling
     self.importance_sampling = self.config.training.importance_sampling
     self.change_of_variables = self.config.training.change_of_variables
+
+    self.clipped_sampling = self.config.training.get('clipped_sampling', False)
+    self.clip_beta = self.config.training.get('clip_beta', 0.0)
+    self.clip_omega = self.config.training.get('clip_omega', 1.0)
+
     if (not hasattr(self.tokenizer, 'mask_token')
         or self.tokenizer.mask_token is None):
       self.mask_index = self.vocab_size
@@ -155,9 +160,12 @@ class Diffusion(L.LightningModule):
   def _validate_configuration(self):
     assert not (self.change_of_variables
                 and self.importance_sampling)
+    assert not (self.clipped_sampling
+                and self.importance_sampling)
     if self.parameterization == 'sedd':
       assert not self.importance_sampling
       assert not self.change_of_variables
+      assert not self.clipped_sampling
     if self.parameterization == 'd3pm':
       assert self.T > 0
     if self.T > 0:
@@ -802,6 +810,10 @@ class Diffusion(L.LightningModule):
     if self.antithetic_sampling:
       offset = torch.arange(n, device=device) / n
       _eps_t = (_eps_t / n + offset) % 1
+    if self.clipped_sampling:
+      mask_rate = self.clip_beta + (self.clip_omega - self.clip_beta) * _eps_t
+      t = self.noise.inverse_total_noise(mask_rate)
+      t = torch.clamp(t, self.sampling_eps, 1.0)
     t = (1 - self.sampling_eps) * _eps_t + self.sampling_eps
     if self.importance_sampling:
       return self.noise.importance_sampling_transformation(t)
