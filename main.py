@@ -170,8 +170,9 @@ def _train(config, logger, tokenizer):
       callbacks.append(hydra.utils.instantiate(callback))
 
   monitor_callback = AttentionMatrixMonitor(
+        config=config,
         log_every_n_steps = omegaconf.OmegaConf.select(
-              config, "trainer.log_scores_every_n_steps", default=1600)
+              config, "trainer.log_scores_every_n_steps", default=3*512)
     )
   callbacks.append(monitor_callback)
 

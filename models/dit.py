@@ -206,13 +206,25 @@ class LabelEmbedder(nn.Module):
     return embeddings
     
 
+class LearnedPositionalEncoding(nn.Module):
+    def __init__(self, max_seq_len, dim):
+        super().__init__()
+        self.position_embeddings = nn.Embedding(max_seq_len, dim)
+        torch.nn.init.normal_(self.position_embeddings.weight, std=0.02)
+        
+    def forward(self, x):
+        positions = torch.arange(x.size(1), device=x.device).expand(x.size(0), -1)
+        position_embeddings = self.position_embeddings(positions)
+        return x + position_embeddings
+
+
 #################################################################################
 #                                 Core Model                                    #
 #################################################################################
 
 
 class DDiTBlock(nn.Module):
-  def __init__(self, dim, n_heads, cond_dim, mlp_ratio=4, dropout=0.1):
+  def __init__(self, dim, n_heads, cond_dim, mlp_ratio=4, dropout=0.1, pe_type='RoPE'):
     super().__init__()
     self.n_heads = n_heads
 
@@ -233,6 +245,7 @@ class DDiTBlock(nn.Module):
     self.adaLN_modulation.weight.data.zero_()
     self.adaLN_modulation.bias.data.zero_()
 
+    self.pe_type = pe_type
 
   def _get_bias_dropout_scale(self):
     if self.training:
@@ -258,10 +271,12 @@ class DDiTBlock(nn.Module):
                     'b s (three h d) -> b s three h d',
                     three=3,
                     h=self.n_heads)
-    with torch.cuda.amp.autocast(enabled=False):
-      cos, sin = rotary_cos_sin
-      qkv = apply_rotary_pos_emb(
-        qkv, cos.to(qkv.dtype), sin.to(qkv.dtype))
+
+    if self.pe_type == 'RoPE':
+      with torch.cuda.amp.autocast(enabled=False):
+        cos, sin = rotary_cos_sin
+        qkv = apply_rotary_pos_emb(
+          qkv, cos.to(qkv.dtype), sin.to(qkv.dtype))
     qkv = rearrange(qkv, 'b s ... -> (b s) ...')
     if seqlens is None:
       cu_seqlens = torch.arange(
@@ -330,18 +345,26 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     self.config = config
     self.vocab_size = vocab_size
 
+    self.pe_type = omegaconf.OmegaConf.select(
+            self.config, "model.init.PE", default='RoPE')
+
     self.vocab_embed = EmbeddingLayer(config.model.hidden_size,
                                       vocab_size)
     self.sigma_map = TimestepEmbedder(config.model.cond_dim)
-    self.rotary_emb = Rotary(
-      config.model.hidden_size // config.model.n_heads)
+
+    if self.pe_type == 'RoPE':  
+      self.pos_emb = Rotary(
+        config.model.hidden_size // config.model.n_heads)
+    else:
+      self.pos_emb = LearnedPositionalEncoding(config.model.length, config.model.hidden_size)
 
     blocks = []
     for _ in range(config.model.n_blocks):
       blocks.append(DDiTBlock(config.model.hidden_size,
                               config.model.n_heads,
                               config.model.cond_dim,
-                              dropout=config.model.dropout))
+                              dropout=config.model.dropout,
+                              pe_type=self.pe_type))
     self.blocks = nn.ModuleList(blocks)
 
     self.output_layer = DDitFinalLayer(
@@ -350,11 +373,22 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
       config.model.cond_dim)
     self.scale_by_sigma = config.model.scale_by_sigma
 
+    tie_weights = omegaconf.OmegaConf.select(
+            config, "model.init.tie_weights", default=True
+    )
+    if tie_weights:
+      # Bias term inside output_layer can still be learnt, this matches BERT
+      self.output_layer.linear.weight = self.vocab_embed.embedding
+
     init_type = omegaconf.OmegaConf.select(
             config, "model.init.type", default='default'
     )
     if init_type == 'symmetric':
-        self.apply_symmetric_initialization()
+      self.apply_symmetric_initialization()
+    elif init_type == 'orthogonal_symmetric':
+      self.apply_orthogonal_init(symmetry=True)
+    elif init_type == 'orthogonal_default':
+      self.apply_orthogonal_init(symmetry=False)
 
   @torch.no_grad()
   def apply_symmetric_initialization(self):
@@ -391,22 +425,19 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
 
       print(f"Symmetric initialization applied to {applied_count} blocks.")
   
-  def apply_optimized_symmetric_init(self):
+  @torch.no_grad()
+  def apply_orthogonal_init(self, symmetry=False):
       """
-      Applies Orthogonal Symmetric Initialization to a DiT model with RoPE.
+      Applies Orthogonal (Default / Symmetric) Initialization to a DiT model with RoPE.
       
       Logic:
       1. Initialize W_q as an Orthogonal matrix. 
         This ensures that the 'Half-Split' pairs (col i and col i+d/2) are 
         orthogonal, maximizing the effectiveness of the RoPE 'twist' from step 0.
-      2. Set W_k = W_q (Hard Symmetry).
+      2. Optional, if symmetry==True: Set W_k = W_q (Hard Symmetry).
         This places the model in the 'Saponati Basin', enabling the speed-up.
       """
-      print("Applying Orthogonal Symmetric Init...")
-      
-      # Loop over all DDiT Blocks
       for i, block in enumerate(self.blocks):
-          
           # Access the fused QKV weight
           qkv_weight = block.attn_qkv.weight.data
           hidden_dim = self.config.model.hidden_size
@@ -423,6 +454,7 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
           
           # Reshape Q to [Heads, Head_Dim, Hidden_Dim]
           q_reshaped = q_chunk.view(n_heads, head_dim, hidden_dim)
+          k_reshaped = k_chunk.view(n_heads, head_dim, hidden_dim)
           
           # Initialize each head independently to be orthogonal
           with torch.no_grad():
@@ -430,16 +462,15 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                   # Generate a semi-orthogonal matrix of shape (Head_Dim, Hidden_Dim)
                   # 'gain=1' is standard for linear layers
                   nn.init.orthogonal_(q_reshaped[h], gain=1.0)
+                  if not symmetry:
+                    nn.init.orthogonal_(k_reshaped[h], gain=1.0)
           
-          # 4. Force Symmetry: Copy Q exactly to K
-          k_chunk.copy_(q_chunk)
-          
+          if symmetry:
+            # 4. Force Symmetry: Copy Q exactly to K
+            k_chunk.copy_(q_chunk)
+            
           # 5. (Optional) Initialize V standardly (e.g., Xavier/Kaiming)
           # nn.init.kaiming_uniform_(v_chunk, a=math.sqrt(5))
-          
-          print(f"Block {i}: W_q orthogonalized and copied to W_k.")
-
-      print("Initialization Complete.")
 
   def _get_bias_dropout_scale(self):
     if self.training:
@@ -451,7 +482,13 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     x = self.vocab_embed(indices)
     c = F.silu(self.sigma_map(sigma))
 
-    rotary_cos_sin = self.rotary_emb(x)
+    if self.pe_type == 'RoPE':
+      rotary_cos_sin = self.pos_emb(x)
+    else:
+      rotary_cos_sin = None
+
+    if self.pe_type == 'LPE':
+      x = self.pos_emb(x)
 
     with torch.cuda.amp.autocast(dtype=torch.bfloat16):
       for i in range(len(self.blocks)):
