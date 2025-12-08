@@ -86,6 +86,7 @@ class Diffusion(L.LightningModule):
     self.clipped_sampling = self.config.training.get('clipped_sampling', False)
     self.clip_beta = self.config.training.get('clip_beta', 0.0)
     self.clip_omega = self.config.training.get('clip_omega', 1.0)
+    print(f'Clipped sampling: {self.clipped_sampling}, {self.clip_beta}, {self.clip_omega}')
 
     if (not hasattr(self.tokenizer, 'mask_token')
         or self.tokenizer.mask_token is None):
@@ -370,7 +371,7 @@ class Diffusion(L.LightningModule):
       attention_mask = batch['attention_mask']
     else:
       attention_mask = None
-    losses = self._loss(batch['input_ids'], attention_mask)
+    losses = self._loss(batch['input_ids'], attention_mask, prefix)
     loss = losses.loss
 
     if prefix == 'train':
@@ -805,16 +806,35 @@ class Diffusion(L.LightningModule):
                         0)[..., None]
     return edge
 
-  def _sample_t(self, n, device):
+  def _sample_t(self, n, device, validation=False):
     _eps_t = torch.rand(n, device=device)
     if self.antithetic_sampling:
       offset = torch.arange(n, device=device) / n
       _eps_t = (_eps_t / n + offset) % 1
-    if self.clipped_sampling:
-      mask_rate = self.clip_beta + (self.clip_omega - self.clip_beta) * _eps_t
+    if self.clipped_sampling and not validation:
+      if "WarmupConstantCosineLRScheduler" in str(self.config.lr_scheduler.get('_target_', '')):
+        config_scheduler = self.config.lr_scheduler
+        
+        phase_decaying_t = config_scheduler.constant_steps + config_scheduler.warmup_steps
+        phase_fixed_t_post_decay = phase_decaying_t + config_scheduler.first_decay_steps
+
+        step = self.trainer.global_step
+        if step < phase_decaying_t:
+          t_min = self.clip_beta
+          t_max = self.clip_omega
+        elif step < phase_fixed_t_post_decay:
+          progress = (step - phase_decaying_t) / (phase_fixed_t_post_decay - phase_decaying_t)
+          t_min = torch.max(0.0, self.clip_beta*(1-progress))
+          t_max = torch.min(1.0, (1-progress) * self.clip_omega + progress)
+        else:
+          t_min = 0.0
+          t_max = 1.0
+      
+      mask_rate = t_min + (t_max - t_min) * _eps_t
       t = self.noise.inverse_total_noise(mask_rate)
-      t = torch.clamp(t, self.sampling_eps, 1.0)
-    t = (1 - self.sampling_eps) * _eps_t + self.sampling_eps
+      t = torch.clamp(t, self.sampling_eps, 1.0-self.sampling_eps)
+    else:
+      t = (1 - self.sampling_eps) * _eps_t + self.sampling_eps
     if self.importance_sampling:
       return self.noise.importance_sampling_transformation(t)
     return t
@@ -856,8 +876,8 @@ class Diffusion(L.LightningModule):
                           dim=-1,
                           index=x0[:, :, None]).squeeze(-1)
 
-  def _forward_pass_diffusion(self, x0):
-    t = self._sample_t(x0.shape[0], x0.device)
+  def _forward_pass_diffusion(self, x0, validation=False):
+    t = self._sample_t(x0.shape[0], x0.device, validation=validation)
     if self.T > 0:
       t = (t * self.T).to(torch.int)
       t = t / self.T
@@ -905,7 +925,10 @@ class Diffusion(L.LightningModule):
     return - log_p_theta * (
       dsigma / torch.expm1(sigma))[:, None]
 
-  def _loss(self, x0, attention_mask):
+  def _loss(self, x0, attention_mask, prefix):
+    validation = False
+    if prefix == 'val' or prefix == 'test': validation = True
+
     (input_tokens, output_tokens,
      attention_mask) = self._maybe_sub_sample(
        x0, attention_mask)
@@ -915,7 +938,7 @@ class Diffusion(L.LightningModule):
       loss = - logprobs.gather(
         -1, output_tokens[:, :, None])[:, :, 0]
     else:
-      loss = self._forward_pass_diffusion(input_tokens)
+      loss = self._forward_pass_diffusion(input_tokens, validation)
     
     nlls = loss * attention_mask
     count = attention_mask.sum()

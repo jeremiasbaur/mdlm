@@ -69,6 +69,87 @@ class CosineDecayWarmupLRScheduler(
       super().step_update(num_updates=self._last_epoch)
 
 
+class WarmupConstantCosineLRScheduler(torch.optim.lr_scheduler._LRScheduler):
+    """
+    4-Phase Scheduler using relative factors of the optimizer's LR.
+    
+    Phases:
+    1. Linear Warmup: (init_factor * base) -> (max_factor * base)
+    2. Constant: Stay at (max_factor * base)
+    3. Cosine Decay 1: (max_factor * base) -> (mid_factor * base)
+    4. Cosine Decay 2: (mid_factor * base) -> (final_factor * base)
+    """
+    def __init__(self, optimizer, warmup_steps, constant_steps, first_decay_steps, second_decay_steps,
+                 init_factor=0.0033, max_factor=2.0, mid_factor=1.0, final_factor=0.04, last_epoch=-1, **kwargs):
+        print(f"\n[DEBUG] Initializing MultiPhaseFactorScheduler with:")
+        print(f"  Warmup: {warmup_steps}, Constant: {constant_steps}")
+        print(f"  Decay1: {first_decay_steps}, Decay2: {second_decay_steps}\n")
+
+        self.warmup_steps = warmup_steps
+        self.constant_steps = constant_steps
+        self.first_decay_steps = first_decay_steps
+        self.second_decay_steps = second_decay_steps
+        
+        # Scaling factors relative to optimizer.lr
+        self.init_factor = init_factor
+        self.max_factor = max_factor
+        self.mid_factor = mid_factor
+        self.final_factor = final_factor
+        
+        # Milestones
+        self.end_warmup = warmup_steps
+        self.end_constant = self.end_warmup + constant_steps
+        self.end_first_decay = self.end_constant + first_decay_steps
+        self.end_second_decay = self.end_first_decay + second_decay_steps
+        self._last_epoch = -1
+        
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        step = self._last_epoch
+        
+        # Helper to scale all parameter groups
+        def scale_lrs(scale):
+            return [base_lr * scale for base_lr in self.base_lrs]
+
+        # Phase 1: Linear Warmup
+        if step < self.end_warmup:
+            progress = step / self.warmup_steps
+            scale = self.init_factor + (self.max_factor - self.init_factor) * progress
+            return scale_lrs(scale)
+        
+        # Phase 2: Constant Peak
+        elif step < self.end_constant:
+            return scale_lrs(self.max_factor)
+        
+        # Phase 3: Cosine Decay 1 (Max -> Mid)
+        elif step < self.end_first_decay:
+            progress = (step - self.end_constant) / self.first_decay_steps
+            cosine = 0.5 * (1 + math.cos(math.pi * progress))
+            # Interpolate between Max and Mid
+            scale = self.mid_factor + (self.max_factor - self.mid_factor) * cosine
+            return scale_lrs(scale)
+        
+        # Phase 4: Cosine Decay 2 (Mid -> Final)
+        elif step < self.end_second_decay:
+            progress = (step - self.end_first_decay) / self.second_decay_steps
+            cosine = 0.5 * (1 + math.cos(math.pi * progress))
+            # Interpolate between Mid and Final
+            scale = self.final_factor + (self.mid_factor - self.final_factor) * cosine
+            return scale_lrs(scale)
+            
+        # Post-Schedule
+        else:
+            return scale_lrs(self.final_factor)
+
+    def step(self, epoch=None):
+        if epoch is None:
+            self._last_epoch += 1
+        else:
+            self._last_epoch = epoch
+        super().step(self._last_epoch)
+
+
 class LoggingContext:
   """Context manager for selective logging."""
   def __init__(self, logger, level=None, handler=None, close=True):

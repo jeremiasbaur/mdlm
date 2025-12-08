@@ -1,0 +1,15 @@
+_target_: utils.WarmupConstantCosineLRScheduler
+warmup_steps: 2500
+constant_steps: 17500
+first_decay_steps: 40000
+second_decay_steps: 40000
+
+# Factors relative to optim.lr (assumed 3e-4)
+init_factor: 0.00333333  # 1e-6 / 3e-4
+max_factor: 2.0          # 6e-4 / 3e-4
+mid_factor: 1.0          # 3e-4 / 3e-4
+final_factor: 0.04       # 1.2e-5 / 3e-4  (which is 0.02 * max_factor)
+
+# Lightning settings
+interval: step
+frequency: 1
