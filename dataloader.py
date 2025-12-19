@@ -372,6 +372,12 @@ def get_dataset(
       'ag_news',
       cache_dir=cache_dir,
       streaming=streaming)
+  elif 'lm1b' in dataset_name:
+    dataset = datasets.load_dataset(
+      dataset_name,
+      trust_remote_code=True,
+      cache_dir=cache_dir,
+      streaming=streaming)
   else:
     dataset = datasets.load_dataset(
       dataset_name,

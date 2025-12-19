@@ -144,7 +144,7 @@ def _ppl_eval(config, logger, tokenizer):
     logger=wandb_logger)
   _, valid_ds = dataloader.get_dataloaders(
     config, tokenizer, skip_train=True, valid_seed=config.seed)
-  trainer.validate(model, valid_ds)
+  print(trainer.validate(model, valid_ds))
 
 
 def _train(config, logger, tokenizer):

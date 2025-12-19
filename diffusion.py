@@ -185,6 +185,15 @@ class Diffusion(L.LightningModule):
       'fit_loop']['epoch_loop.batch_progress'][
         'current']['completed']
 
+    state_dict = checkpoint["state_dict"]
+    # backwards compability for rotary_emb inv_frequency tag
+    keys_to_rename = [k for k in state_dict.keys() if "backbone.rotary_emb" in k]
+    
+    for old_key in keys_to_rename:
+        new_key = old_key.replace("backbone.rotary_emb", "backbone.pos_emb")
+        state_dict[new_key] = state_dict.pop(old_key)
+    
+    
   def on_save_checkpoint(self, checkpoint):
     if self.ema:
       checkpoint['ema'] = self.ema.state_dict()
@@ -824,8 +833,8 @@ class Diffusion(L.LightningModule):
           t_max = self.clip_omega
         elif step < phase_fixed_t_post_decay:
           progress = (step - phase_decaying_t) / (phase_fixed_t_post_decay - phase_decaying_t)
-          t_min = torch.max(0.0, self.clip_beta*(1-progress))
-          t_max = torch.min(1.0, (1-progress) * self.clip_omega + progress)
+          t_min = max(0.0, self.clip_beta*(1-progress))
+          t_max = min(1.0, (1-progress) * self.clip_omega + progress)
         else:
           t_min = 0.0
           t_max = 1.0

@@ -1,32 +1,49 @@
 #!/bin/bash
 #SBATCH -J T_mdlm                     # Job name
-#SBATCH -o watch_folder/%x_%j.out     # log file (out & err)
-#SBATCH -N 1                          # Total number of nodes requested
-#SBATCH --get-user-env                # retrieve the users login environment
-#SBATCH --mem=100000                  # server memory requested (per node)
-#SBATCH -t 960:00:00                  # Time limit (hh:mm:ss)
-#SBATCH --partition=gpu               # Request partition
-#SBATCH --constraint="[a5000|a6000|a100|3090]"
+#SBATCH -D /cluster/raid/home/jbaur/projects/mdlm/
+#SBATCH --get-user-env
+#SBATCH --mail-type=FAIL,END
+#SBATCH --mail-user=jdframes0@gmail.com
+#SBATCH --ntasks=1
+#SBATCH --mem=32000
 #SBATCH --ntasks-per-node=4
-#SBATCH --gres=gpu:4                  # Type/number of GPUs needed
-#SBATCH --open-mode=append            # Do not overwrite logs
-#SBATCH --requeue                     # Requeue upon preemption
+#SBATCH --cpus-per-task=8
+#SBATCH --gres=gpu:rtx3090:4
+#SBATCH --time=4-23:59:59
+#SBATCH --output=notebook_%j.log
+#SBATCH --export=ALL,SRC_DIR=/cluster/raid/data/jbaur
 
-checkpoint_path=/share/kuleshov/ssahoo/textdiffusion/text-diff-mulan-v2-scalar-owt-not-tZycWP-small-param-subs_data-openwebtext-split_seqlen-1024_maxs-1300001_bs-512/checkpoints/60-1000000.ckpt
+checkpoint_path=/cluster/raid/home/jbaur/projects/mdlm/outputs/openwebtext-train/2025.12.11/215109/checkpoints/5-102000.ckpt
 
 export HYDRA_FULL_ERROR=1
+
+# Load Anaconda
+source /cluster/software/anaconda3/etc/profile.d/conda.sh
+# Activate your Conda environment
+conda activate /cluster/raid/home/jbaur/.conda/envs/mdlm
+
+echo "Running on node: $(hostname)"
+echo "Allocated GPUs:"
+nvidia-smi
+which python
 
 for T in 0 1000; do
   echo "$T"
   srun python -u -m main \
-    mode=ppl_eval \
     loader.batch_size=16 \
     loader.eval_batch_size=16 \
-    data=openwebtext-split \
-    model=small \
+    mode=ppl_eval \
+    model=tiny \
+    model.init.type=symmetric \
+    model.init.tie_weights=False \
+    model.init.PE=RoPE \
+    training.clipped_sampling=True \
+    training.clip_beta=0.1 \
+    training.clip_omega=0.2 \
+    data=wikitext2 \
     parameterization=subs \
-    backbone=dit \
     model.length=1024 \
+    eval.compute_generative_perplexity=True \
     T="$T" \
     eval.checkpoint_path=$checkpoint_path \
     +wandb.offline=true
