@@ -385,10 +385,24 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     )
     if init_type == 'symmetric':
       self.apply_symmetric_initialization()
+    elif init_type == 'antisymmetric':
+      self.apply_antisymmetric_initialization()
     elif init_type == 'orthogonal_symmetric':
       self.apply_orthogonal_init(symmetry=True)
     elif init_type == 'orthogonal_default':
       self.apply_orthogonal_init(symmetry=False)
+    elif init_type == 'unitary_symmetric':
+      self.apply_orthogonal_init(symmetry=True, unitary=True)
+    elif init_type == 'unitary_default':
+      self.apply_orthogonal_init(symmetry=False, unitary=True)
+    elif init_type == 'orthogonal_symmetric_tied':
+      self.apply_orthogonal_init(symmetry=True, tied=True)
+    elif init_type == 'orthogonal_default_tied':
+      self.apply_orthogonal_init(symmetry=False, tied=True)
+    elif init_type == 'unitary_symmetric_tied':
+      self.apply_orthogonal_init(symmetry=True, tied=True, unitary=True)
+    elif init_type == 'unitary_default_tied':
+      self.apply_orthogonal_init(symmetry=False, tied=True, unitary=True)
 
   @torch.no_grad()
   def apply_symmetric_initialization(self):
@@ -425,8 +439,102 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
 
       print(f"Symmetric initialization applied to {applied_count} blocks.")
   
+
   @torch.no_grad()
-  def apply_orthogonal_init(self, symmetry=False):
+  def apply_antisymmetric_initialization(self, alpha=0.5):
+    """
+    Applies antisymmetric initialization to Wq and Wk matrices in-place.
+    
+    Logic based on:
+        W_q = Base + (Noise * alpha)
+        W_k = Base - (Noise * alpha)
+        
+    Where Base, Noise is the already initialized W_q, W_k matrix, respectively.
+    
+    Args:
+        alpha (float): Scaling factor for the antisymmetric component. 
+                        alpha=0 results in perfect symmetry (Wq = Wk).
+    """
+    print(f"Applying antisymmetric initialization (alpha={alpha})...")
+    
+    if not hasattr(self, 'blocks'):
+        print("Warning: Model has no 'blocks' attribute. Skipping init.")
+        return
+    scale_factor = 1.0 / math.sqrt(1 + alpha**2)
+    applied_count = 0
+    for i, block in enumerate(self.blocks):
+        if not (hasattr(block, 'attn_qkv') and 
+                isinstance(block.attn_qkv, nn.Linear)):
+            print(f"Warning: Skipping block {i}, 'attn_qkv' not found.")
+            continue
+
+        qkv_weight = block.attn_qkv.weight
+
+        # Split into Q, K, V weights (assumes dim 0 is 3 * hidden_dim)
+        q_weight, k_weight, _ = torch.chunk(qkv_weight, 3, dim=0)
+        
+        W_base = torch.zeros_like(q_weight)
+        W_base.copy_(q_weight)
+        W_noise = torch.zeros_like(q_weight)
+        W_noise.copy_(k_weight)
+        
+        # Apply the formula: Q = Base + A*a, K = Base - A*a
+        target_q = (W_base + (W_noise * alpha))*scale_factor
+        target_k = (W_base - (W_noise * alpha))*scale_factor
+        
+        # Copy values back into the layer weights
+        q_weight.copy_(target_q)
+        k_weight.copy_(target_k)
+
+        applied_count += 1
+
+    print(f"Antisymmetric initialization applied to {applied_count} blocks.")
+
+  @torch.no_grad()
+  def init_complex_semi_unitary_(self, tensor_view):
+      """
+      Initializes a tensor of shape [Head_Dim, Hidden_Dim] as a 
+      Complex Semi-Unitary matrix mapped to reals.
+      Assumes 'Half-Split' RoPE format: [Reals, Imags].
+      """
+      out_dim, in_dim = tensor_view.shape
+      
+      # Treat dimensions as complex (halved)
+      c_out = out_dim // 2
+      c_in = in_dim // 2
+      
+      # Shape: [c_out, c_in]
+      if c_out < c_in:
+        Z = (torch.randn(c_in, c_out, device=tensor_view.device) + 
+            1j * torch.randn(c_in, c_out, device=tensor_view.device)) / math.sqrt(2)
+        # QR Decomposition to orthogonalize rows
+        Q_complex, _ = torch.linalg.qr(Z, mode='reduced')
+        Q_complex = Q_complex.T
+      else:
+        Z = (torch.randn(c_out, c_in, device=tensor_view.device) + 
+            1j * torch.randn(c_out, c_in, device=tensor_view.device)) / math.sqrt(2)
+        # QR Decomposition to orthogonalize rows
+        Q_complex, _ = torch.linalg.qr(Z, mode='reduced')
+      
+      # Map back to Real Block Structure for Half-Split
+      # If z = x + iy, then W * z becomes:
+      # [[A, -B], [B, A]] * [x, y]^T
+      
+      A = Q_complex.real  # Shape [c_out, c_in]
+      B = Q_complex.imag  # Shape [c_out, c_in]
+      
+      # Fill the tensor view
+      # Top-Left: A (Real interaction)
+      tensor_view[:c_out, :c_in] = A
+      # Top-Right: -B (Neg Imag interaction)
+      tensor_view[:c_out, c_in:] = -B
+      # Bottom-Left: B (Imag interaction)
+      tensor_view[c_out:, :c_in] = B
+      # Bottom-Right: A (Real interaction)
+      tensor_view[c_out:, c_in:] = A
+
+  @torch.no_grad()
+  def apply_orthogonal_init(self, symmetry=False, tied=False, unitary=False):
       """
       Applies Orthogonal (Default / Symmetric) Initialization to a DiT model with RoPE.
       
@@ -437,6 +545,21 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
       2. Optional, if symmetry==True: Set W_k = W_q (Hard Symmetry).
         This places the model in the 'Saponati Basin', enabling the speed-up.
       """
+
+      def get_symmetrize_hook(hidden_dim):
+        def hook(grad):
+            # grad shape is [3*hidden_dim, hidden_dim]
+            q_grad = grad[:hidden_dim]
+            k_grad = grad[hidden_dim:2*hidden_dim]
+            
+            shared_grad = q_grad + k_grad 
+            
+            # 2. Overwrite both Q and K gradients with the shared gradient
+            grad[:hidden_dim] = shared_grad
+            grad[hidden_dim:2*hidden_dim] = shared_grad
+            return grad
+        return hook
+
       for i, block in enumerate(self.blocks):
           # Access the fused QKV weight
           qkv_weight = block.attn_qkv.weight.data
@@ -445,7 +568,6 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
           # Extract Q, K, V (views)
           q_chunk = qkv_weight[0:hidden_dim]
           k_chunk = qkv_weight[hidden_dim:2*hidden_dim]
-          #v_chunk = qkv_weight[2*hidden_dim:]
           
           # Orthogonalize Q
           # We process Q 'Head-wise' to be rigorous, though global orthogonality is also fine.
@@ -459,18 +581,39 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
           # Initialize each head independently to be orthogonal
           with torch.no_grad():
               for h in range(n_heads):
-                  # Generate a semi-orthogonal matrix of shape (Head_Dim, Hidden_Dim)
-                  # 'gain=1' is standard for linear layers
-                  nn.init.orthogonal_(q_reshaped[h], gain=1.0)
-                  if not symmetry:
-                    nn.init.orthogonal_(k_reshaped[h], gain=1.0)
+                  if unitary:
+                    self.init_complex_semi_unitary_(q_reshaped[h])
+                  else:
+                    # Generate a semi-orthogonal matrix of shape (Head_Dim, Hidden_Dim)
+                    # 'gain=1' is standard for linear layers
+                    nn.init.orthogonal_(q_reshaped[h], gain=1.0)
+
+                  if not (symmetry or tied):
+                    if unitary:
+                      self.init_complex_semi_unitary_(k_reshaped[h])
+                    else:
+                      nn.init.orthogonal_(k_reshaped[h], gain=1.0)
+
           
-          if symmetry:
-            # 4. Force Symmetry: Copy Q exactly to K
-            k_chunk.copy_(q_chunk)
+          if tied:
+            # Step A: Value Initialization
+            if symmetry:
+                with torch.no_grad():
+                    k_chunk.copy_(q_chunk)
             
+            # Gradient Tying
+            # We register a hook on the parameter to keep them tied forever.
+            if not hasattr(block.attn_qkv.weight, "_has_tied_hook"):
+                block.attn_qkv.weight.register_hook(get_symmetrize_hook(hidden_dim))
+                block.attn_qkv.weight._has_tied_hook = True
+
+          elif symmetry and not tied:
+            # 4. Force Symmetry: Copy Q exactly to K without weight tying
+            k_chunk.copy_(q_chunk)
+          
           # 5. (Optional) Initialize V standardly (e.g., Xavier/Kaiming)
           # nn.init.kaiming_uniform_(v_chunk, a=math.sqrt(5))
+
 
   def _get_bias_dropout_scale(self):
     if self.training:

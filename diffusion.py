@@ -821,6 +821,8 @@ class Diffusion(L.LightningModule):
       offset = torch.arange(n, device=device) / n
       _eps_t = (_eps_t / n + offset) % 1
     if self.clipped_sampling and not validation:
+      t_min = self.clip_beta
+      t_max = self.clip_omega
       if "WarmupConstantCosineLRScheduler" in str(self.config.lr_scheduler.get('_target_', '')):
         config_scheduler = self.config.lr_scheduler
         
